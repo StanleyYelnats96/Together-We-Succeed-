@@ -1,1 +1,1 @@
-# Together-We-Succeed-
+Together-We-Succeed
