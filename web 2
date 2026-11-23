@@ -1,0 +1,292 @@
+
+-- TOGETHER WE SUCCEED
+-- COMMUNITY DATABASE
+
+create extension if not exists pgcrypto;
+
+create table public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  display_name text not null default '',
+  trade text default '',
+  interests text default '',
+  about text default '',
+  created_at timestamptz default now()
+);
+
+create table public.admins (
+  user_id uuid primary key references auth.users(id) on delete cascade
+);
+
+create table public.events (
+  id uuid primary key default gen_random_uuid(),
+  organizer_id uuid not null references auth.users(id),
+  title text not null,
+  category text not null,
+  event_date date not null,
+  event_time time not null,
+  location text not null,
+  details text default '',
+  capacity integer,
+  created_at timestamptz default now()
+);
+
+create table public.rsvps (
+  id uuid primary key default gen_random_uuid(),
+  event_id uuid not null references public.events(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  status text not null default 'going'
+    check(status in ('going','cancelled')),
+  created_at timestamptz default now(),
+  unique(event_id,user_id)
+);
+
+-- Automatically create member profiles
+
+create or replace function public.new_member()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  insert into public.profiles(id,display_name)
+  values(new.id,coalesce(new.raw_user_meta_data->>'display_name',''));
+  return new;
+end;
+$$;
+
+create trigger after_user_signup
+after insert on auth.users
+for each row execute procedure public.new_member();
+
+-- Secure administrator check
+
+create or replace function public.is_admin()
+returns boolean
+language sql
+security definer
+stable
+set search_path = ''
+as $$
+  select exists(
+    select 1 from public.admins
+    where user_id = auth.uid()
+  );
+$$;
+
+grant execute on function public.is_admin() to authenticated;
+
+-- Enable security
+
+alter table public.profiles enable row level security;
+alter table public.admins enable row level security;
+alter table public.events enable row level security;
+alter table public.rsvps enable row level security;
+
+-- Profiles
+
+create policy "Members can view profiles"
+on public.profiles for select
+to authenticated
+using (true);
+
+create policy "Members update own profile"
+on public.profiles for update
+to authenticated
+using (id = auth.uid())
+with check (id = auth.uid());
+
+-- Events
+
+create policy "Authenticated members view events"
+on public.events for select
+to authenticated
+using (true);
+
+create policy "Members create events"
+on public.events for insert
+to authenticated
+with check (organizer_id = auth.uid());
+
+create policy "Organizers and admins update events"
+on public.events for update
+to authenticated
+using (organizer_id = auth.uid() or public.is_admin())
+with check (organizer_id = auth.uid() or public.is_admin());
+
+create policy "Organizers and admins delete events"
+on public.events for delete
+to authenticated
+using (organizer_id = auth.uid() or public.is_admin());
+
+-- RSVPs
+
+create policy "Members view RSVPs"
+on public.rsvps for select
+to authenticated
+using (true);
+
+create policy "Members RSVP themselves"
+on public.rsvps for insert
+to authenticated
+with check (user_id = auth.uid());
+
+create policy "Members update their RSVP"
+on public.rsvps for update
+to authenticated
+using (user_id = auth.uid())
+with check (user_id = auth.uid());
+
+create policy "Members cancel their RSVP"
+on public.rsvps for delete
+to authenticated
+using (user_id = auth.uid());
+
+-- Helpful indexes
+
+create index events_date_idx on public.events(event_date);
+create index events_organizer_idx on public.events(organizer_id);
+create index rsvps_event_idx on public.rsvps(event_id);
+
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  try {
+    const authHeader = req.headers.get("Authorization");
+
+    if (!authHeader) {
+      throw new Error("Authentication required");
+    }
+
+    const url = Deno.env.get("SUPABASE_URL")!;
+    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const resendKey = Deno.env.get("RESEND_API_KEY")!;
+    const fromEmail = Deno.env.get("FROM_EMAIL")!;
+
+    const admin = createClient(url, serviceKey);
+
+    const token = authHeader.replace("Bearer ", "");
+
+    const { data: authData, error: authError } =
+      await admin.auth.getUser(token);
+
+    if (authError || !authData.user) {
+      throw new Error("Invalid login");
+    }
+
+    const user = authData.user;
+    const { event_id, type } = await req.json();
+
+    if (type !== "rsvp" || !event_id) {
+      throw new Error("Invalid notification request");
+    }
+
+    const { data: event, error: eventError } =
+      await admin.from("events")
+        .select("*")
+        .eq("id", event_id)
+        .single();
+
+    if (eventError || !event) {
+      throw new Error("Event not found");
+    }
+
+    const { data: rsvp } = await admin.from("rsvps")
+      .select("id,status")
+      .eq("event_id", event_id)
+      .eq("user_id", user.id)
+      .eq("status", "going")
+      .maybeSingle();
+
+    if (!rsvp) {
+      throw new Error("An active RSVP is required");
+    }
+
+    const { data: organizer } =
+      await admin.auth.admin.getUserById(event.organizer_id);
+
+    const { data: profile } = await admin.from("profiles")
+      .select("display_name")
+      .eq("id", user.id)
+      .maybeSingle();
+
+    const memberName = profile?.display_name || "Community member";
+
+    const emailHtml = `
+      <div style="font-family:Arial;padding:25px;color:#26352f">
+        <h1 style="color:#284b3d">
+          TOGETHER WE SUCCEED
+        </h1>
+        <h2>New meetup RSVP!</h2>
+        <p>${memberName} has requested to attend your event.</p>
+        <hr>
+        <h3>${event.title}</h3>
+        <p>Date: ${event.event_date}</p>
+        <p>Time: ${event.event_time}</p>
+        <p>Location: ${event.location}</p>
+        <p>Let's build friendships beyond work.</p>
+      </div>
+    `;
+
+    const recipients = [
+      organizer.user?.email,
+      user.email
+    ].filter(Boolean);
+
+    const response = await fetch(
+      "https://api.resend.com/emails",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${resendKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          from: fromEmail,
+          to: [...new Set(recipients)],
+          subject: `Meetup RSVP: ${event.title}`,
+          html: emailHtml
+        })
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error("Email delivery failed");
+    }
+
+    return new Response(
+      JSON.stringify({ success: true }),
+      {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+  } catch (error) {
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      {
+        status: 400,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+  }
+});
+
+create index rsvps_user_idx on public.rsvps(user_id);
